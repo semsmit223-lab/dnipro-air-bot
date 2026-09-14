@@ -1364,7 +1364,16 @@ def collect_kucher_local():
 def fetch_channel_alert_state(channel, channel_url):
     posts = fetch_channel_posts(channel, channel_url)
 
-    city_on, tsar_on = ua_siren.flags()
+    try:
+        city_on, tsar_on = ua_siren.flags()
+    except (requests.RequestException, RuntimeError, ValueError):
+        logger.warning(
+            "ukrainealarm недоступний; використовую лише "
+            "дані Telegram-каналів"
+        )
+        city_on = None
+        tsar_on = None
+
     latest_event = {
         "state": city_on,
         "tsar_state": tsar_on,
