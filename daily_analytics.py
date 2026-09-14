@@ -2,8 +2,13 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 from pathlib import Path
 import json
+import os
 
-PATH = Path("/home/ubuntu/dnipro-air-bot/daily_stats.json")
+BASE_DIR = Path(
+    os.getenv("BOT_DATA_DIR")
+    or Path(__file__).resolve().parent
+)
+PATH = BASE_DIR / "daily_stats.json"
 TZ = ZoneInfo("Europe/Kyiv")
 
 
@@ -26,8 +31,11 @@ def _empty(day):
 def load():
     day = _today()
     try:
-        data = json.loads(PATH.read_text())
-    except Exception:
+        data = json.loads(PATH.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        data = _empty(day)
+
+    if not isinstance(data, dict):
         data = _empty(day)
     if data.get("day") != day:
         data = _empty(day)
@@ -35,7 +43,16 @@ def load():
 
 
 def save(data):
-    PATH.write_text(json.dumps(data, ensure_ascii=False))
+    temporary_path = PATH.with_suffix(".tmp")
+
+    try:
+        temporary_path.write_text(
+            json.dumps(data, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        os.replace(temporary_path, PATH)
+    except OSError:
+        pass
 
 
 def note_alert(prev, cur):
@@ -60,7 +77,7 @@ def note_threat(tid, km):
         km = float(km)
         if data.get("min_km") is None or km < data["min_km"]:
             data["min_km"] = km
-    except Exception:
+    except (TypeError, ValueError):
         pass
     save(data)
 
