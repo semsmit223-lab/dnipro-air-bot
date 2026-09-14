@@ -1,5 +1,4 @@
 import asyncio
-from collections import deque
 import html
 from html.parser import HTMLParser
 from http.server import (
@@ -10,6 +9,7 @@ import json
 import logging
 import math
 import os
+from pathlib import Path
 import re
 import sys
 import threading
@@ -21,6 +21,7 @@ import requests
 from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    KeyboardButton,
     ReplyKeyboardMarkup,
     ReplyKeyboardRemove,
     Update,
@@ -41,8 +42,23 @@ from telegram.ext import (
     filters,
 )
 
+import daily_analytics
+import mapa_client
+import ua_siren
+
 
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+BASE_DIR = Path(
+    os.getenv("BOT_DATA_DIR")
+    or Path(__file__).resolve().parent
+)
+MEDIA_DIR = BASE_DIR / "media"
+ADMIN_IDS = frozenset(
+    int(part)
+    for part in os.getenv("BOT_ADMIN_IDS", "").replace(",", " ").split()
+    if part.lstrip("-").isdigit()
+)
+ANALYTICS_CHAT_ID = os.getenv("BOT_ANALYTICS_CHAT_ID", "")
 
 THREATS_URL = "https://neptun.in.ua/api/v1/threats"
 ALERTS_URL = "https://neptun.in.ua/api/v1/alerts"
@@ -55,7 +71,8 @@ FAST_DNIPRO_ALERT_CHANNEL = "timofii_kucher"
 FAST_DNIPRO_ALERT_CHANNEL_URL = (
     "https://t.me/s/timofii_kucher"
 )
-DNIPRO_ALERT_CHECK_INTERVAL_SECONDS = 5
+DNIPRO_ALERT_CHECK_INTERVAL_SECONDS = 20
+LOCAL_CHANNEL_POLL_INTERVAL_SECONDS = 30
 
 CHECK_INTERVAL_SECONDS = 5
 HTTP_RETRY_ATTEMPTS = 3
@@ -68,10 +85,10 @@ MONITOR_RESTART_DELAY_SECONDS = 5
 CHAT_CONCURRENCY_LIMIT = 10
 UPDATE_INTERVAL_SECONDS = 120
 ALERT_HISTORY_LIMIT = 200
-SUMMARY_INTERVAL_SECONDS = 600
-SETTINGS_FILE = "user_settings.json"
-RUNTIME_STATE_FILE = "runtime_state.json"
+SETTINGS_FILE = str(BASE_DIR / "user_settings.json")
+RUNTIME_STATE_FILE = str(BASE_DIR / "runtime_state.json")
 RUNTIME_STATE_VERSION = 2
+TARGET_NUMBER_LIMIT = 5000
 RUNTIME_STATE_SAVE_INTERVAL_SECONDS = 30
 AUTO_DELETE_SECONDS = 600
 AUTO_DELETE_RETRY_SECONDS = 60
@@ -80,7 +97,9 @@ RED_DISTANCE_KM = 50
 # Орієнтовна зона міста для повідомлення про вхід цілі.
 # Це не точна адміністративна межа.
 CITY_ENTRY_RADIUS_KM = 15
+NIGHT_THREAT_RADIUS_KM = 30
 DISTANCE_CHANGE_KM = 5
+COURSE_TOLERANCE_DEGREES = 50
 WAR_START_DATE = date(2022, 2, 24)
 
 CITIES = {
@@ -88,6 +107,12 @@ CITIES = {
         "Дніпро",
         48.4647,
         35.0462,
+        "Дніпропетров",
+    ),
+    "Tsarychanka": (
+        "Царичанка",
+        48.937,
+        34.478,
         "Дніпропетров",
     ),
     "Kyiv": (
@@ -138,11 +163,6 @@ RADIUS_OPTIONS = {
 }
 
 user_settings = {}
-multiple_points = {}
-threat_history = {}
-event_history = {}
-alarm_history = {}
-last_known_threats = {}
 known_threats = {}
 last_update_time = {}
 last_alert_states = {}
@@ -150,7 +170,6 @@ last_dnipro_city_alert_states = {}
 alert_start_times = {}
 city_threats_inside = {}
 alert_history = {}
-last_summary_time = {}
 quiet_mode = {}
 daily_silence_delivery_dates = {}
 target_numbers = {}
@@ -160,6 +179,7 @@ message_deletion_tasks = {}
 dnipro_city_alert_cache = {
     "checked_at": 0.0,
     "state": None,
+    "tsar_state": None,
     "post_id": None,
     "channel": FAST_DNIPRO_ALERT_CHANNEL,
 }
@@ -252,14 +272,20 @@ def load_settings():
 
 
 def save_settings():
+    temporary_file = f"{SETTINGS_FILE}.tmp"
+
     try:
-        with open(SETTINGS_FILE, "w", encoding="utf-8") as file:
+        with open(temporary_file, "w", encoding="utf-8") as file:
             json.dump(
                 user_settings,
                 file,
                 ensure_ascii=False,
                 indent=2,
             )
+            file.flush()
+            os.fsync(file.fileno())
+
+        os.replace(temporary_file, SETTINGS_FILE)
     except OSError:
         logger.exception("Не вдалося зберегти налаштування")
 
@@ -275,6 +301,8 @@ def load_runtime_state():
     global last_silence_date
     global pending_message_deletions
     global runtime_state_dirty
+    global alert_history
+    global quiet_mode
 
     try:
         with open(
@@ -320,6 +348,8 @@ def load_runtime_state():
             "daily_silence_delivery_dates",
         ),
         ("target_numbers", "target_numbers"),
+        ("alert_history", "alert_history"),
+        ("quiet_mode", "quiet_mode"),
     ):
         value = data.get(key)
 
@@ -352,6 +382,17 @@ def load_runtime_state():
             daily_silence_delivery_dates = value
         elif target_name == "target_numbers":
             target_numbers = value
+        elif target_name == "alert_history":
+            alert_history = {
+                str(chat_key): entries[-ALERT_HISTORY_LIMIT:]
+                for chat_key, entries in value.items()
+                if isinstance(entries, list)
+            }
+        elif target_name == "quiet_mode":
+            quiet_mode = {
+                str(chat_key): bool(enabled)
+                for chat_key, enabled in value.items()
+            }
 
     stored_deletions = data.get(
         "pending_message_deletions"
@@ -439,6 +480,8 @@ def save_runtime_state(force=False):
             daily_silence_delivery_dates
         ),
         "target_numbers": target_numbers,
+        "alert_history": alert_history,
+        "quiet_mode": quiet_mode,
         "pending_message_deletions": (
             pending_message_deletions
         ),
@@ -481,6 +524,9 @@ def default_settings():
     return {
         "city": "Dnipro",
         "radius": "100",
+        "use_custom_location": False,
+        "custom_lat": None,
+        "custom_lon": None,
     }
 
 
@@ -557,10 +603,22 @@ async def stop_monitoring_button(
     )
 
 
+def nearest_city_key(latitude, longitude):
+    closest_key = "Dnipro"
+    closest_distance = None
+    for city_key, (_, city_lat, city_lon, _) in CITIES.items():
+        current = distance_km(latitude, longitude, city_lat, city_lon)
+        if closest_distance is None or current < closest_distance:
+            closest_distance = current
+            closest_key = city_key
+    return closest_key
+
 def city_info(chat_id):
     settings = get_settings(chat_id)
     city_key = settings["city"]
     city_name, latitude, longitude, oblast = CITIES[city_key]
+    if settings.get("use_custom_location") and settings.get("custom_lat") is not None and settings.get("custom_lon") is not None:
+        return ("Моя локація", float(settings["custom_lat"]), float(settings["custom_lon"]), oblast)
     return city_name, latitude, longitude, oblast
 
 
@@ -601,6 +659,10 @@ def danger_level(alert):
     )
 
 
+def is_night_hours():
+    hour=datetime.now(ZoneInfo("Europe/Kyiv")).hour
+    return hour < 6
+
 def is_quiet_mode(chat_id):
     return quiet_mode.get(
         str(chat_id),
@@ -610,6 +672,7 @@ def is_quiet_mode(chat_id):
 
 def set_quiet_mode(chat_id, enabled):
     quiet_mode[str(chat_id)] = enabled
+    mark_runtime_state_dirty()
 
 
 def get_alert_history(chat_id):
@@ -622,8 +685,6 @@ def get_alert_history(chat_id):
 
 
 def add_alert_event(chat_id, event_type):
-    key = str(chat_id)
-
     history = get_alert_history(chat_id)
 
     history.append(
@@ -637,6 +698,8 @@ def add_alert_event(chat_id, event_type):
 
     if len(history) > ALERT_HISTORY_LIMIT:
         del history[:-ALERT_HISTORY_LIMIT]
+
+    mark_runtime_state_dirty()
 
 
 def format_duration(seconds):
@@ -719,18 +782,53 @@ def main_keyboard():
         [
             ["▶️ Старт", "⏹ Стоп"],
             ["🚨 Стан", "🛸 Загрози"],
-            ["📊 Обстановка", "📈 Історія"],
-            ["📋 Журнал", "📊 Статистика"],
-            ["📍 Точки", "🔕 Тихий режим"],
-            ["🚨 Небезпека", "ℹ️ Допомога"],
-            ["📍 Місто", "📏 Радіус"],
-            ["🔄 Оновити"],
-            ["❌ Вийти"],
+            ["📌 Моя локація", "🔕 Тихий режим"],
+            ["⚙️ Налаштування", "ℹ️ Допомога"],
         ],
         resize_keyboard=True,
         is_persistent=True,
         selective=True,
     )
+
+
+def settings_keyboard():
+    return ReplyKeyboardMarkup(
+        [
+            ["📍 Місто", "📏 Радіус"],
+            ["📍 Точки", "📊 Обстановка"],
+            ["📈 Історія", "📊 Статистика"],
+            ["📋 Журнал", "🚨 Небезпека"],
+            ["🔄 Оновити", "❌ Вийти"],
+            ["⬅️ Назад"],
+        ],
+        resize_keyboard=True,
+        is_persistent=True,
+        selective=True,
+    )
+
+
+
+# Кнопки, що змінюють налаштування чату або стан моніторингу.
+RESTRICTED_BUTTONS = frozenset(
+    {
+        "▶️ Старт",
+        "⏹ Стоп",
+        "🔕 Тихий режим",
+        "📍 Місто",
+        "📌 Моя локація",
+        "📏 Радіус",
+        "❌ Вийти",
+    }
+    | {city_name for city_name, _, _, _ in CITIES.values()}
+    | {
+        "🔴 10 км",
+        "🔴 50 км",
+        "🟠 100 км",
+        "🟡 200 км",
+        "🟢 500 км",
+        "🇺🇦 Вся Україна",
+    }
+)
 
 
 async def can_use_keyboard(update, context):
@@ -775,6 +873,7 @@ async def keyboard_for_user(update, context):
 
 def city_keyboard():
     rows = [[city_name] for city_name, _, _, _ in CITIES.values()]
+    rows.insert(0, [KeyboardButton("📌 Надіслати геолокацію", request_location=True)])
     rows.append(["⬅️ Назад"])
     return ReplyKeyboardMarkup(
         rows,
@@ -848,6 +947,23 @@ def distance_km(lat1, lon1, lat2, lon2):
     )
 
 
+def heading_toward_point(
+    heading,
+    a,
+    b,
+    c,
+    d,
+    tolerance=COURSE_TOLERANCE_DEGREES,
+):
+    if heading is None: return False
+    try: h=float(heading)
+    except (TypeError, ValueError): return False
+    sl,so,el,eo=map(math.radians,[a,b,c,d])
+    x=math.sin(eo-so)*math.cos(el)
+    y=math.cos(sl)*math.sin(el)-math.sin(sl)*math.cos(el)*math.cos(eo-so)
+    target=(math.degrees(math.atan2(x,y))+360)%360
+    return abs((h-target+180)%360-180)<=tolerance
+
 def direction(degrees):
     if degrees is None:
         return "—"
@@ -862,8 +978,20 @@ def direction(degrees):
         "захід",
         "північний захід",
     ]
-    return directions[int((degrees + 22.5) / 45) % 8]
+    try:
+        degrees = float(degrees)
+    except (TypeError, ValueError):
+        return "—"
 
+    return directions[int(math.floor((degrees % 360) / 45 + 0.5)) % 8]
+
+
+def dnipro_bank_label(lat, lon):
+    if lat is None or lon is None: return None
+    try: lat=float(lat); lon=float(lon)
+    except (TypeError, ValueError): return None
+    if distance_km(lat, lon, 48.4647, 35.0462) > 22: return None
+    return "лівий берег" if lon >= 35.055 else "правий берег"
 
 def threat_name(threat):
     if threat.get("title"):
@@ -895,6 +1023,31 @@ def target_number(threat):
     return target_numbers[threat_id]
 
 
+def prune_target_numbers():
+    """Обмежує розмір кешу номерів цілей."""
+    if len(target_numbers) <= TARGET_NUMBER_LIMIT:
+        return
+
+    active_ids = {
+        threat_id
+        for threats in known_threats.values()
+        for threat_id in threats
+    }
+    stale_ids = [
+        threat_id
+        for threat_id in target_numbers
+        if threat_id not in active_ids
+    ]
+    stale_ids.sort(key=lambda key: target_numbers[key])
+
+    for threat_id in stale_ids[
+        : len(target_numbers) - TARGET_NUMBER_LIMIT
+    ]:
+        del target_numbers[threat_id]
+
+    mark_runtime_state_dirty()
+
+
 def retry_delay(attempt, base, maximum):
     return min(
         base * (2**attempt),
@@ -903,8 +1056,6 @@ def retry_delay(attempt, base, maximum):
 
 
 def fetch_response(url, headers=None):
-    last_error = None
-
     for attempt in range(HTTP_RETRY_ATTEMPTS):
         try:
             response = requests.get(
@@ -912,17 +1063,9 @@ def fetch_response(url, headers=None):
                 timeout=10,
                 headers=headers,
             )
-
-            if (
-                response.status_code == 429
-                or response.status_code >= 500
-            ):
-                response.raise_for_status()
-
             response.raise_for_status()
             return response
         except requests.RequestException as error:
-            last_error = error
             response = getattr(error, "response", None)
             status_code = getattr(
                 response,
@@ -956,7 +1099,9 @@ def fetch_response(url, headers=None):
             )
             time.sleep(delay)
 
-    raise last_error
+    raise RuntimeError(
+        f"Не вдалося виконати запит до {url}"
+    )
 
 
 def fetch_json(url):
@@ -1094,27 +1239,149 @@ def classify_dnipro_city_alert(text):
     return None
 
 
-def fetch_channel_alert_state(channel, channel_url):
+pending_kucher_locals=[]
+last_local_channel_poll=0.0
+
+DNIPROAL_HINTS=("бпла","шахед","ракет","баліст","курс","пуск","дніпр","нагорк","ігрень","чечел","шосе","лівий","правий","реактив","зник","укритт")
+NYI_HINTS=("бпла","шахед","ракет","баліст","курс","пуск","дніпр","запорізьк","полтав","мілер","ппу","4.5.0","реактив","тривог")
+KUCHER_HINTS=("бпла","шахед","ракет","баліст","курс","нагорк","ігрень","чечел","шосе","укритт","зник","низько","висота","реактив","парк","лівий","правий","новік","придні","дослідн")
+
+
+def read_last_post_id(path):
+    if not path.exists():
+        return 0
+
+    try:
+        return int(path.read_text().strip() or 0)
+    except (OSError, ValueError):
+        return 0
+
+
+def write_last_post_id(path, post_id):
+    try:
+        path.write_text(str(post_id))
+    except OSError:
+        logger.exception(
+            "Не вдалося зберегти стан каналу %s",
+            path.name,
+        )
+
+
+def fetch_channel_posts(channel, channel_url):
     response = fetch_response(
         channel_url,
         headers={
-            "User-Agent": (
-                "Mozilla/5.0 "
-                "DniproAirAlertBot/1.0"
-            ),
+            "User-Agent": "Mozilla/5.0 DniproAirAlertBot/1.0",
         },
     )
-    response.raise_for_status()
-
     parser = TelegramChannelPostParser(channel)
     parser.feed(response.text)
+    return sorted(parser.posts, key=lambda item: item["id"])
 
-    latest_event = None
 
-    for post in sorted(
-        parser.posts,
-        key=lambda item: item["id"],
-    ):
+def collect_local_channel(
+    channel,
+    channel_url,
+    state_file,
+    hints,
+    clean,
+    line_limit,
+):
+    """Збирає нові локальні повідомлення каналу."""
+    path = BASE_DIR / state_file
+    last_id = read_last_post_id(path)
+    posts = fetch_channel_posts(channel, channel_url)
+
+    if not posts:
+        return
+
+    if last_id == 0:
+        write_last_post_id(path, posts[-1]["id"])
+        return
+
+    for post in posts:
+        if post["id"] <= last_id:
+            continue
+
+        last_id = post["id"]
+        raw = clean(post["text"])
+        normalized = raw.lower()
+
+        if "повітряної тривоги" in normalized:
+            continue
+
+        if len(raw) > 5000:
+            continue
+
+        if not any(hint in normalized for hint in hints):
+            continue
+
+        line = raw.splitlines()[0][:line_limit]
+
+        if line:
+            pending_kucher_locals.append(line)
+
+    write_last_post_id(path, last_id)
+
+
+def collect_dniproal_local():
+    collect_local_channel(
+        DNIPRO_ALERT_CHANNEL,
+        DNIPRO_ALERT_CHANNEL_URL,
+        "last_dniproal_local.txt",
+        DNIPROAL_HINTS,
+        lambda text: text.split("t.me/")[0].strip(),
+        160,
+    )
+
+
+def collect_nyi_local():
+    collect_local_channel(
+        "ny_i_dnipro",
+        "https://t.me/s/ny_i_dnipro",
+        "last_nyi_local.txt",
+        NYI_HINTS,
+        lambda text: (
+            text.replace("t.me/ny_i_dnipro", "")
+            .replace("НУ І ДНІПРО", "")
+            .strip()
+        ),
+        160,
+    )
+
+
+def collect_kucher_local():
+    collect_local_channel(
+        FAST_DNIPRO_ALERT_CHANNEL,
+        FAST_DNIPRO_ALERT_CHANNEL_URL,
+        "last_kucher_local.txt",
+        KUCHER_HINTS,
+        lambda text: text.split("t.me/")[0].strip(),
+        140,
+    )
+
+
+def fetch_channel_alert_state(channel, channel_url):
+    posts = fetch_channel_posts(channel, channel_url)
+
+    try:
+        city_on, tsar_on = ua_siren.flags()
+    except (requests.RequestException, RuntimeError, ValueError):
+        logger.warning(
+            "ukrainealarm недоступний; використовую лише "
+            "дані Telegram-каналів"
+        )
+        city_on = None
+        tsar_on = None
+
+    latest_event = {
+        "state": city_on,
+        "tsar_state": tsar_on,
+        "post_id": None,
+        "channel": "ukrainealarm",
+    }
+
+    for post in posts:
         state = classify_dnipro_city_alert(
             post["text"]
         )
@@ -1122,15 +1389,10 @@ def fetch_channel_alert_state(channel, channel_url):
         if state is not None:
             latest_event = {
                 "state": state,
+                "tsar_state": tsar_on,
                 "post_id": post["id"],
                 "channel": channel,
             }
-
-    if latest_event is None:
-        raise LookupError(
-            "У стрічці каналу не знайдено стан "
-            "тривоги Дніпровського району"
-        )
 
     return latest_event
 
@@ -1444,6 +1706,7 @@ async def send_message(
     chat_id,
     text,
     reply_markup=None,
+    auto_delete=True,
 ):
     message = None
 
@@ -1498,11 +1761,12 @@ async def send_message(
             "Telegram не повернув надіслане повідомлення"
         )
 
-    schedule_message_deletion(
-        bot,
-        chat_id,
-        message.message_id,
-    )
+    if auto_delete:
+        schedule_message_deletion(
+            bot,
+            chat_id,
+            message.message_id,
+        )
 
     return message
 
@@ -1538,6 +1802,7 @@ async def send_daily_silence_to_chat(
             bot,
             chat_id,
             text,
+            auto_delete=False,
         )
     except TimedOut:
         logger.warning(
@@ -1563,6 +1828,29 @@ def get_war_day():
     ).days + 1
 
 
+last_morning_date=None
+async def send_daily_morning(bot):
+    global last_morning_date
+    now=datetime.now(ZoneInfo("Europe/Kyiv"))
+    today=now.date()
+    path=BASE_DIR / "last_morning.txt"
+    if last_morning_date is None and path.exists():
+        try: last_morning_date=date.fromisoformat(path.read_text().strip())
+        except (OSError, ValueError): last_morning_date=None
+    if last_morning_date==today: return
+    start=now.replace(hour=6, minute=0, second=0, microsecond=0)
+    if not (start<=now<start+timedelta(minutes=60)): return
+    text=("🌅 <b>НОВИЙ ДЕНЬ</b>\n\n"+"На один день ближче до смерті хуйла.")
+    for chat_key in tuple(user_settings.keys()):
+        try:
+            chat_id=int(chat_key)
+            if is_quiet_mode(chat_id): continue
+            await send_message(bot, chat_id, text, auto_delete=False)
+        except Exception:
+            logger.exception("morning %s", chat_key)
+    last_morning_date=today
+    path.write_text(today.isoformat())
+
 async def send_daily_silence(bot):
     global last_silence_date
 
@@ -1578,7 +1866,7 @@ async def send_daily_silence(bot):
 
     scheduled_time = now.replace(
         hour=9,
-        minute=10,
+        minute=0,
         second=0,
         microsecond=0,
     )
@@ -1589,7 +1877,7 @@ async def send_daily_silence(bot):
         )
     )
 
-    # Початок о 09:10; невдалі доставки повторюються
+    # Початок о 09:00; невдалі доставки повторюються
     # лише в межах контрольованого вікна.
     if not (
         scheduled_time <= now < retry_window_end
@@ -1600,7 +1888,7 @@ async def send_daily_silence(bot):
 
     text = (
         f"🇺🇦 <b>ДЕНЬ ВІЙНИ — {day}</b>\n\n"
-        "🕯️ <b>09:10 — хвилина мовчання</b>\n"
+        "🕯️ <b>09:00 — хвилина мовчання</b>\n"
         "Вшануймо пам'ять полеглих Героїв.\n\n"
         "🤍 Ще один день до Перемоги.\n"
         "<b>Пам'ятаємо. Тримаємося. "
@@ -1655,7 +1943,7 @@ async def send_daily_silence(bot):
 
 
 def format_threat_message(chat_id, distance, threat, update=False):
-    city_name, _, _, _ = city_info(chat_id)
+    city_name, target_lat, target_lon, _ = city_info(chat_id)
 
     if distance <= RED_DISTANCE_KM:
         icon = "🔴"
@@ -1666,20 +1954,23 @@ def format_threat_message(chat_id, distance, threat, update=False):
         )
     else:
         icon = "🟠"
-        level = "ОНОВЛЕННЯ" if update else "ЗАГРОЗА В РАДІУСІ"
+        level = "ОНОВЛЕННЯ" if update else "ЦІЛЬ НАБЛИЖАЄТЬСЯ"
 
     text = (
         f"{icon} <b>{level}</b>\n\n"
         f"🎯 <b>ЦІЛЬ №{target_number(threat)}</b>\n"
         f"🛸 <b>{html.escape(threat_name(threat))}</b>\n"
         f"📍 Моніторинг: <b>{html.escape(city_name)}</b>\n"
-        f"📏 До {html.escape(city_name)}: "
+        f"📏 Відстань: "
         f"<b>~{round(distance)} км</b>\n"
     )
 
     heading = threat.get("heading")
     if heading is not None:
-        text += f"➡️ Напрямок: <b>{direction(heading)}</b>\n"
+        if threat.get("lat") is not None and threat.get("lon") is not None and heading_toward_point(heading, float(threat.get("lat")), float(threat.get("lon")), target_lat, target_lon): text += f"🎯 <b>Курс: на {html.escape(city_name)}</b>\n"
+        bank = dnipro_bank_label(threat.get("lat"), threat.get("lon"))
+        if bank: text += f"🏙 Дніпро, <b>{bank}</b>\n"
+        text += f"➡️ Напрямок руху: <b>{direction(heading)}</b>\n"
 
     velocity = threat.get("velocity") or {}
     speed = velocity.get("speedKmh")
@@ -1688,17 +1979,17 @@ def format_threat_message(chat_id, distance, threat, update=False):
 
     uncertainty = threat.get("uncertaintyKm")
     if uncertainty and not update:
-        text += f"🎯 Похибка позиції: ±{round(uncertainty)} км\n"
+        text += f"🎯 Похибка: ±{round(uncertainty)} км\n"
 
     return text + (
         "\n⚠️ Інформація орієнтовна.\n"
         "Орієнтуйтеся на офіційні сигнали тривоги.\n\n"
-        "🔗 <a href='https://neptun.in.ua/'>Дані про загрози</a>"
+        ""
     )
 
 
 def format_threat_list(chat_id, nearby):
-    city_name, _, _, _ = city_info(chat_id)
+    city_name, target_lat, target_lon, _ = city_info(chat_id)
     radius_text = radius_label(chat_id)
 
     if not nearby:
@@ -1727,6 +2018,8 @@ def format_threat_list(chat_id, nearby):
         )
 
         heading = threat.get("heading")
+        if heading is not None and threat.get("lat") is not None and threat.get("lon") is not None and heading_toward_point(heading, float(threat.get("lat")), float(threat.get("lon")), target_lat, target_lon):
+            text += "🎯 Курс у вашу сторону\n"
         if heading is not None:
             text += f"➡️ {direction(heading)}\n"
 
@@ -1744,6 +2037,109 @@ def format_threat_list(chat_id, nearby):
     )
 
 
+async def is_bot_admin(update):
+    """Дозволяє службові команди лише власникам бота."""
+    user = update.effective_user
+
+    if user is None or user.id not in ADMIN_IDS:
+        if update.message is not None:
+            await update.message.reply_text(
+                "⛔️ Команда доступна лише адміністраторам бота."
+            )
+
+        return False
+
+    return True
+
+
+async def testcard_command(update, context):
+    if not await is_bot_admin(update):
+        return
+
+    chat_id=update.effective_chat.id
+    bot=context.bot
+    pairs=((True,"ТЕСТ. Тривога. Листівка."),(False,"ТЕСТ. Відбій. Листівка."))
+    for state, cap in pairs:
+        st=MEDIA_DIR / ("tryvoga.webp" if state else "vidbiy.webp")
+        with open(st, "rb") as sticker_file:
+            await bot.send_sticker(chat_id=chat_id, sticker=sticker_file)
+        await bot.send_message(chat_id=chat_id, text=cap)
+
+
+async def send_daily_analytics(bot):
+    da = daily_analytics
+    now = datetime.now(ZoneInfo("Europe/Kyiv"))
+    data = da.load()
+    if data.get("sent_evening"):
+        return
+    if now.hour != 21:
+        return
+    text = da.build_text()
+    data["sent_evening"] = True
+    da.save(data)
+    for key in list(user_settings.keys()):
+        cid = int(key)
+        if not monitoring_enabled(cid):
+            continue
+        if get_settings(cid).get("city") not in ("Dnipro", "Tsarychanka"):
+            continue
+        try:
+            await send_message(bot, cid, text, auto_delete=False)
+        except Exception:
+            logger.exception("daily analytics")
+
+
+
+async def chek_command(update, context):
+    if not await is_bot_admin(update):
+        return
+
+    total = sum(1 for k in user_settings if str(k).lstrip("-").isdigit() and int(k)>0)
+    on = 0
+    for key in list(user_settings.keys()):
+        try:
+            if monitoring_enabled(int(key)):
+                on += 1
+        except (TypeError, ValueError):
+            continue
+    text = (
+        f"Людей: {total}\n"
+        f"Моніторинг увімкнено: {on}"
+    )
+    await update.message.reply_text(text)
+
+
+async def testdaystats_command(update, context):
+    if not await is_bot_admin(update):
+        return
+
+    await update.message.reply_text(
+        daily_analytics.build_text(),
+        parse_mode="HTML",
+    )
+
+
+async def testday_command(update, context):
+    if not await is_bot_admin(update):
+        return
+
+    day=get_war_day()
+    await update.message.reply_text("🌅 <b>НОВИЙ ДЕНЬ</b>\n\nНа один день ближче до смерті хуйла.", parse_mode="HTML")
+    await update.message.reply_text("🇺🇦 <b>ДЕНЬ ВІЙНИ — "+str(day)+"</b>\n\n🕯️ <b>09:00 — хвилина мовчання</b>\nВшануймо полеглих Героїв.\n\n🤍 Ще один день до Перемоги.\n<b>Памятаємо. Тримаємося. Переможемо.</b>", parse_mode="HTML")
+
+async def test_command(update, context):
+    if not await is_bot_admin(update):
+        return
+
+    samples=[
+    "🚨 <b>ТРИВОГА САМЕ У ДНІПРІ</b>\n\n📍 <b>Місто Дніпро</b>\n\n⚠️ Негайно пройдіть в укриття.",
+    "🟠 <b>ЗАГРОЗА В РАДІУСІ</b>\n\n🎯 <b>ЦІЛЬ №3</b>\n🛸 <b>БпЛА</b>\n📏 Відстань: <b>~12 км</b>\n🏙 Дніпро, <b>лівий берег</b>\n🎯 <b>Курс у вашу сторону</b>",
+    "🛸 <b>Локально</b>\nНагорка",
+    "ℹ️ <b>Нічний режим</b>\nЗ 00:00 до 06:00 лише сирена в місті та ціль ближче 30 км."
+    ]
+    for s in samples:
+        await update.message.reply_text(s, parse_mode="HTML")
+
 async def start_command(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
@@ -1753,7 +2149,7 @@ async def start_command(
 
     chat_id = update.effective_chat.id
     get_settings(chat_id)
-    city_name, _, _, _ = city_info(chat_id)
+    city_name, target_lat, target_lon, _ = city_info(chat_id)
 
     await update.message.reply_text(
         (
@@ -1779,7 +2175,7 @@ async def start_command(
 
 
 async def status_text(chat_id):
-    city_name, _, _, _ = city_info(chat_id)
+    city_name, target_lat, target_lon, _ = city_info(chat_id)
 
     try:
         alert, alert_since = await asyncio.to_thread(
@@ -1810,7 +2206,7 @@ async def status_text(chat_id):
 
 
 async def situation_text(chat_id):
-    city_name, _, _, _ = city_info(chat_id)
+    city_name, target_lat, target_lon, _ = city_info(chat_id)
 
     try:
         alert, alert_since = await asyncio.to_thread(
@@ -2044,7 +2440,7 @@ async def points_text(chat_id):
 
 
 async def danger_text(chat_id):
-    city_name, _, _, _ = city_info(chat_id)
+    city_name, target_lat, target_lon, _ = city_info(chat_id)
 
     try:
         alert, alert_since = await asyncio.to_thread(
@@ -2240,7 +2636,7 @@ async def help_command(
         return
 
     chat_id = update.effective_chat.id
-    city_name, _, _, _ = city_info(chat_id)
+    city_name, target_lat, target_lon, _ = city_info(chat_id)
 
     await update.message.reply_text(
         (
@@ -2264,6 +2660,14 @@ async def help_command(
     )
 
 
+async def location_handler(update, context):
+    if update.message is None or update.message.location is None: return
+    chat_id=update.effective_chat.id
+    lat=float(update.message.location.latitude); lon=float(update.message.location.longitude)
+    s=get_settings(chat_id)
+    s["use_custom_location"]=True; s["custom_lat"]=lat; s["custom_lon"]=lon; s["city"]=nearest_city_key(lat,lon); save_settings()
+    await update.message.reply_text("✅ Локацію збережено. Курс рахується від вас.", reply_markup=await keyboard_for_user(update, context))
+
 async def text_button_handler(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
@@ -2278,6 +2682,17 @@ async def text_button_handler(
     chat_id = update.effective_chat.id
     get_settings(chat_id)
     button = update.message.text
+
+    if (
+        button in RESTRICTED_BUTTONS
+        and not await can_use_keyboard(update, context)
+    ):
+        await update.message.reply_text(
+            "⛔️ Керування доступне лише власнику "
+            "або адміністратору чату."
+        )
+        return
+
     keyboard = await keyboard_for_user(
         update,
         context,
@@ -2289,6 +2704,21 @@ async def text_button_handler(
             "Щоб повернути меню, надішліть команду /start.",
             parse_mode="HTML",
             reply_markup=ReplyKeyboardRemove(),
+        )
+        return
+
+
+    if button == "⚙️ Налаштування":
+        await update.effective_message.reply_text(
+            "Налаштування:",
+            reply_markup=settings_keyboard(),
+        )
+        return
+
+    if button == "⬅️ Назад":
+        await update.effective_message.reply_text(
+            "Головне меню",
+            reply_markup=await keyboard_for_user(update, context),
         )
         return
 
@@ -2394,7 +2824,7 @@ async def text_button_handler(
         await help_command(update, context)
         return
 
-    if button == "📍 Місто":
+    if button in ("📍 Місто", "📌 Моя локація"):
         await update.message.reply_text(
             "📍 <b>ОБЕРІТЬ МІСТО МОНІТОРИНГУ</b>",
             parse_mode="HTML",
@@ -2424,18 +2854,6 @@ async def text_button_handler(
         )
         return
 
-    if button == "⬅️ Назад":
-        await update.message.reply_text(
-            (
-                "🛡️ <b>ДНІПРО • AIR MONITOR</b>\n\n"
-                f"📍 Точка: <b>{html.escape(city_info(chat_id)[0])}</b>\n"
-                f"📏 Радіус: <b>{html.escape(radius_label(chat_id))}</b>"
-            ),
-            parse_mode="HTML",
-            reply_markup=keyboard,
-        )
-        return
-
     city_key = next(
         (
             key
@@ -2446,6 +2864,7 @@ async def text_button_handler(
     )
     if city_key is not None:
         user_settings[str(chat_id)]["city"] = city_key
+        user_settings[str(chat_id)]["use_custom_location"] = False
         save_settings()
         await update.message.reply_text(
             (
@@ -2539,7 +2958,7 @@ async def button_handler(
 
         user_settings[str(chat_id)]["city"] = city_key
         save_settings()
-        city_name, _, _, _ = city_info(chat_id)
+        city_name, target_lat, target_lon, _ = city_info(chat_id)
 
         text = (
             "✅ <b>МІСТО ЗМІНЕНО</b>\n\n"
@@ -2642,45 +3061,6 @@ async def check_city_entry(
         if distance <= CITY_ENTRY_RADIUS_KM:
             current_inside.add(threat_id)
 
-            # Повідомляємо тільки в момент входу.
-            if threat_id not in previous_inside:
-                text = (
-                    "🔴 <b>ЦІЛЬ У ЗОНІ МІСТА</b>\n\n"
-                    f"📍 <b>{html.escape(city_name)}</b>\n\n"
-                    f"🎯 Ціль №{target_number(threat)}\n"
-                    f"🛸 Ціль: "
-                    f"<b>{html.escape(threat_name(threat))}</b>\n"
-                    f"📏 Орієнтовна відстань: "
-                    f"<b>~{round(distance)} км</b>\n\n"
-                    "⚠️ Інформація автоматичного "
-                    "моніторингу та може містити похибку.\n"
-                    "Орієнтуйтеся на офіційні сигнали "
-                    "повітряної тривоги."
-                )
-
-                try:
-                    await send_message(
-                        bot,
-                        chat_id,
-                        text,
-                    )
-                except TimedOut:
-                    logger.warning(
-                        "Результат повідомлення про вхід "
-                        "цілі %s у місто для чату %s "
-                        "невідомий; повтор пропущено, "
-                        "щоб уникнути дублювання",
-                        threat_id,
-                        chat_id,
-                    )
-                except Exception:
-                    current_inside.discard(threat_id)
-                    logger.exception(
-                        "Не вдалося надіслати "
-                        "повідомлення про вхід "
-                        "цілі в місто"
-                    )
-
     if previous_inside != current_inside:
         city_threats_inside[chat_key] = current_inside
         mark_runtime_state_dirty()
@@ -2693,6 +3073,8 @@ async def notify_dnipro_city_alert(
     source_state,
 ):
     state = source_state.get("state")
+    if get_settings(chat_id).get("city") == "Tsarychanka":
+        state = source_state.get("tsar_state", state)
 
     if state is None:
         return
@@ -2722,35 +3104,35 @@ async def notify_dnipro_city_alert(
             f"https://t.me/{channel}"
         )
 
-    source_name = (
-        "@"
-        + channel
+    source_name = "@" + channel
+    is_tsarychanka = (
+        get_settings(chat_id).get("city") == "Tsarychanka"
     )
+    place = (
+        "Царичанка"
+        if is_tsarychanka
+        else "Місто Дніпро"
+    )
+    title_place = "У ЦАРИЧАНЦІ" if is_tsarychanka else "САМЕ У ДНІПРІ"
 
     if state:
         event_type = "dnipro_city_start"
         text = (
-            "🚨 <b>ТРИВОГА САМЕ У ДНІПРІ</b>\n\n"
-            "📍 <b>Місто Дніпро</b>\n\n"
-            f"За повідомленням каналу {source_name} "
-            "оголошено тривогу.\n"
+            f"🚨 <b>ТРИВОГА {title_place}</b>\n\n"
+            f"📍 <b>{place}</b> — оголошено тривогу.\n"
             "⚠️ Негайно пройдіть в укриття.\n\n"
-            f"🔗 <a href='{source_url}'>"
-            f"Джерело: {source_name}</a>\n"
-            "ℹ️ Канал є додатковим, неофіційним "
-            "джерелом."
+            f"🔗 Джерело: "
+            f"<a href='{source_url}'>"
+            f"{html.escape(source_name)}</a>\n"
         )
     else:
         event_type = "dnipro_city_end"
         text = (
-            "✅ <b>ВІДБІЙ ТРИВОГИ САМЕ У ДНІПРІ</b>\n\n"
-            "📍 <b>Місто Дніпро</b>\n\n"
-            f"За повідомленням каналу {source_name} "
-            "зафіксовано відбій.\n\n"
-            f"🔗 <a href='{source_url}'>"
-            f"Джерело: {source_name}</a>\n"
-            "ℹ️ Канал є додатковим, неофіційним "
-            "джерелом."
+            f"✅ <b>ВІДБІЙ ТРИВОГИ {title_place}</b>\n\n"
+            f"📍 <b>{place}</b> — зафіксовано відбій.\n\n"
+            f"🔗 Джерело: "
+            f"<a href='{source_url}'>"
+            f"{html.escape(source_name)}</a>\n"
         )
 
     if is_quiet_mode(chat_id):
@@ -2760,11 +3142,14 @@ async def notify_dnipro_city_alert(
         return
 
     try:
-        await send_message(
-            bot,
-            chat_id,
-            text,
-        )
+        st=MEDIA_DIR / ("tryvoga.webp" if state else "vidbiy.webp")
+        if st.exists():
+            with open(st, "rb") as sticker_file:
+                await bot.send_sticker(
+                    chat_id=chat_id,
+                    sticker=sticker_file,
+                )
+        await send_message(bot, chat_id, text)
     except TimedOut:
         logger.warning(
             "Результат міського сповіщення для "
@@ -2787,7 +3172,7 @@ async def monitor_alerts_for_chat(
 ):
     if alert_data is not None:
         try:
-            city_name, _, _, _ = city_info(chat_id)
+            city_name, target_lat, target_lon, _ = city_info(chat_id)
             alert, alert_since = (
                 get_alert_state_from_data(
                     chat_id,
@@ -2826,9 +3211,19 @@ async def monitor_alerts_for_chat(
                     )
 
                 try:
-                    if is_quiet_mode(chat_id):
+                    if (
+                        is_quiet_mode(chat_id)
+                        or is_night_hours()
+                    ):
                         transition_recorded = True
                     else:
+                        st=MEDIA_DIR / ("tryvoga.webp" if alert else "vidbiy.webp")
+                        if st.exists():
+                            with open(st, "rb") as sticker_file:
+                                await bot.send_sticker(
+                                    chat_id=chat_id,
+                                    sticker=sticker_file,
+                                )
                         await send_message(
                             bot,
                             chat_id,
@@ -2860,13 +3255,21 @@ async def monitor_alerts_for_chat(
 
                 if alert != previous_alert:
                     mark_runtime_state_dirty()
+                if ANALYTICS_CHAT_ID and str(chat_id)==ANALYTICS_CHAT_ID:
+                    try:
+                        daily_analytics.note_alert(
+                            bool(previous_alert),
+                            bool(alert),
+                        )
+                    except OSError:
+                        logger.exception("daily analytics")
         except Exception:
             logger.exception(
                 "Не вдалося перевірити стан тривоги "
                 f"для чату {chat_key}"
             )
 
-    if get_settings(chat_id).get("city") == "Dnipro":
+    if get_settings(chat_id).get("city") in ("Dnipro", "Tsarychanka"):
         try:
             await notify_dnipro_city_alert(
                 bot,
@@ -2923,6 +3326,11 @@ async def monitor_threats_for_chat(
     current_threats = {}
 
     for distance, threat in visible:
+        if ANALYTICS_CHAT_ID and str(chat_id)==ANALYTICS_CHAT_ID:
+            try:
+                daily_analytics.note_threat(threat.get('id'), distance)
+            except OSError:
+                logger.exception("daily analytics")
         threat_id = str(threat.get("id") or "")
 
         if not threat_id:
@@ -2940,6 +3348,12 @@ async def monitor_threats_for_chat(
 
         try:
             if previous_distance is None:
+                if (
+                    is_night_hours()
+                    and distance > NIGHT_THREAT_RADIUS_KM
+                ):
+                    last_update_time[state_key] = now
+                    continue
                 await send_message(
                     bot,
                     chat_id,
@@ -2973,6 +3387,12 @@ async def monitor_threats_for_chat(
                 else:
                     text += "🔺 Ціль віддаляється."
 
+                if (
+                    is_night_hours()
+                    and distance > NIGHT_THREAT_RADIUS_KM
+                ):
+                    last_update_time[state_key] = now
+                    continue
                 await send_message(
                     bot,
                     chat_id,
@@ -3018,6 +3438,16 @@ async def monitor_threats_for_chat(
                 f"оновлення цілі {threat_id}"
             )
 
+    for gone_id in list(previous_ids):
+        if gone_id not in current_threats:
+            last_update_time.pop(f"{chat_key}:{gone_id}", None)
+
+            try:
+                await send_message(bot, chat_id, "✅ Ціль №"+str(target_numbers.get(str(gone_id), gone_id))+" більше не в радіусі.")
+            except Exception:
+                logger.exception(
+                    "Не вдалося повідомити про зникнення цілі"
+                )
     if known_threats.get(chat_key) != current_threats:
         known_threats[chat_key] = current_threats
         mark_runtime_state_dirty()
@@ -3035,12 +3465,49 @@ async def monitor_once(bot):
     if not active_chats:
         return
 
+    global last_local_channel_poll
+    now_monotonic = time.monotonic()
+
+    if (
+        now_monotonic - last_local_channel_poll
+        >= LOCAL_CHANNEL_POLL_INTERVAL_SECONDS
+    ):
+        last_local_channel_poll = now_monotonic
+
+        try:
+            await asyncio.to_thread(collect_kucher_local)
+            await asyncio.to_thread(collect_nyi_local)
+            await asyncio.to_thread(collect_dniproal_local)
+        except Exception:
+            logger.exception("kucher local")
+
+    if pending_kucher_locals:
+        texts=ua_siren.pick_locals(list(pending_kucher_locals))
+        pending_kucher_locals.clear()
+        for chat_key, chat_id in active_chats:
+            if is_quiet_mode(chat_id): continue
+            st=get_settings(chat_id)
+            city=st.get("city")
+            if city not in ("Dnipro", "Tsarychanka") and not st.get("use_custom_location"): continue
+            for raw in texts:
+                try:
+                    cut=raw.split("Дніпро Alerts")[0].split("НУ І ДНІПРО")[0].split("t.me/")[0].strip(" •\n")
+                    if cut:
+                        if city=="Tsarychanka":
+                            low=cut.lower()
+                            keys=("царич","магдал","китайгород","піщан","личков","багате")
+                            if not any(k in low for k in keys): continue
+                        await send_message(bot, chat_id, "🛸 <b>Локально</b>\n"+html.escape(cut))
+                except Exception: logger.exception("kucher send")
+
     dnipro_city_source_state = {
         "state": None,
+        "tsar_state": None,
         "post_id": None,
     }
     has_dnipro_chat = any(
-        get_settings(chat_id).get("city") == "Dnipro"
+        get_settings(chat_id).get("city")
+        in ("Dnipro", "Tsarychanka")
         for _, chat_id in active_chats
     )
     source_tasks = [
@@ -3152,10 +3619,7 @@ async def monitor_once(bot):
                 ),
             )
 
-    await asyncio.to_thread(
-        save_runtime_state,
-        True,
-    )
+    await asyncio.to_thread(save_runtime_state)
 
     if all_threats is None:
         return
@@ -3198,10 +3662,8 @@ async def monitor_once(bot):
                 ),
             )
 
-    await asyncio.to_thread(
-        save_runtime_state,
-        True,
-    )
+    prune_target_numbers()
+    await asyncio.to_thread(save_runtime_state)
 
 
 async def monitor_loop(application):
@@ -3211,9 +3673,11 @@ async def monitor_loop(application):
         cycle_started = time.monotonic()
 
         try:
+            await send_daily_morning(application.bot)
             await send_daily_silence(
                 application.bot,
             )
+            await send_daily_analytics(application.bot)
 
             await monitor_once(application.bot)
             if failed_cycles:
@@ -3345,6 +3809,24 @@ def build_application():
         CommandHandler("start", start_command)
     )
     application.add_handler(
+        CommandHandler("testday", testday_command),
+    )
+    application.add_handler(
+            CommandHandler("testdaystats", testdaystats_command),
+        )
+    application.add_handler(
+            CommandHandler("chek", chek_command),
+        )
+    application.add_handler(
+        CommandHandler("testcard", testcard_command)
+    )
+    application.add_handler(
+        CommandHandler("test", test_command)
+    )
+    application.add_handler(
+        CommandHandler("testmapa", testmapa_command)
+    )
+    application.add_handler(
         CommandHandler("status", status_command)
     )
     application.add_handler(
@@ -3358,6 +3840,9 @@ def build_application():
     )
     application.add_handler(
         CommandHandler("help", help_command)
+    )
+    application.add_handler(
+        MessageHandler(filters.LOCATION, location_handler),
     )
     application.add_handler(
         MessageHandler(
@@ -3409,6 +3894,38 @@ def run_application_supervisor(application_factory):
                 ),
             )
             time.sleep(delay)
+
+
+async def testmapa_command(update, context):
+    if update.effective_chat is None or update.message is None:
+        return
+
+    if not await is_bot_admin(update):
+        return
+
+    try:
+        data = await asyncio.to_thread(mapa_client.fetch_current)
+        chat_id = update.effective_chat.id
+        _, lat, lon, _ = city_info(chat_id)
+        radius = radius_value(chat_id) or 50
+        near = mapa_client.nearby_threats(data, lat, lon, radius_km=radius)
+        if not near:
+            await update.message.reply_text("MAPA: no targets in " + str(int(radius)) + " km")
+            return
+        out = ["MAPA \u2022 " + str(len(near)) + " in " + str(int(radius)) + " km"]
+        for o in near[:8]:
+            title = o.get("title") or o.get("kind") or "?"
+            dist = o.get("distance_km")
+            heading = o.get("heading")
+            part = "\u2022 " + str(title)
+            if dist is not None:
+                part += " | ~" + str(dist) + " km"
+            if heading is not None:
+                part += " | h " + str(heading)
+            out.append(part)
+        await update.message.reply_text("\n".join(out))
+    except Exception as e:
+        await update.message.reply_text("MAPA error: " + type(e).__name__ + ": " + str(e)[:200])
 
 
 def main():

@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+user_settings.json
+runtime_state.json
+daily_stats.json
+.env
